@@ -167,6 +167,10 @@ class WildcatInferenceOnSamplingROI:
                     t3 = time.time()
 
                     print(f'Completed in {t3-t0:6.4f}s, wildcat: {t1-t0:6.4f}s, draw: {t2-t1:6.4f}s, write: {t3-t2:6.4f}s')
+            
+            # Store the state for the future
+            with open(state_file, 'wt') as state_fd:
+                json.dump(curr_state, state_fd)
         
     def run_on_task(self,
                     task: SamplingROITask,
