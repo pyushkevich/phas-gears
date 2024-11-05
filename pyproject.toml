@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["phas_gears"]
+
+
+[project]
+name = "phas-gears"
+version = "0.0.1"
+dependencies = [
+    "phas",
+    "tangle-cnn"
+]

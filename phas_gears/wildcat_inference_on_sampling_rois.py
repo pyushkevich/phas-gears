@@ -16,10 +16,11 @@ from PIL import Image
 
 class WildcatInferenceOnSamplingROI:
 
-    def __init__(self, wildcat:TrainedWildcat):
+    def __init__(self, wildcat:TrainedWildcat, suffix):
         self.wildcat = wildcat
         self.gcs_client = None
         self.gcs_cache = None
+        self.suffix = suffix
     
     def run_on_slide(self,
                      slide: Slide,
@@ -107,7 +108,8 @@ class WildcatInferenceOnSamplingROI:
                                               window_size=window, 
                                               extra_shrinkage=shrink, 
                                               region=region_r, 
-                                              target_resolution=target_resolution)
+                                              target_resolution=target_resolution,
+                                              crop=True)
                     t1 = time.time()
 
                     '''
@@ -125,14 +127,22 @@ class WildcatInferenceOnSamplingROI:
                     # Create a blank image to store segmentation of the trapezoid
                     d_size, d_spacing, d_origin = dens.GetSize(), dens.GetSpacing(), dens.GetOrigin()
                     seg = Image.new('L', (d_size[0], d_size[1]))
+                    
+                    # Compute an affine transformation that maps the coordinates of the sampling ROI,
+                    # which are in raw pixel units to the pixel units of the density image
 
                     # Shift the trapezoid to the xmin/ymin and draw trapezoid
-                    M = np.array([[1., 0., -x_min], [0., 1., -y_min]])
+                    # M = np.array([[1., 0., -x_min], [0., 1., -y_min]])
+                    M = np.zeros((2,3))
+                    for i in range(2):
+                        M[i,i] = raw_spacing[i] / d_spacing[i]
+                        M[i,2] = (0.5 * raw_spacing[i] - d_origin[i]) / d_spacing[i]
                     geom_data = affine_transform_roi(geom_data, M)
+                    print(geom_data)
 
                     # Spacing scaling factors used for drawing trapezoid
-                    sf = [raw_spacing[i]/d_spacing[i] for i in range(2)]
-                    draw_sampling_roi(seg, geom_data, sf[0], sf[1], fill=1)
+                    # sf = [raw_spacing[i]/d_spacing[i] for i in range(2)]
+                    draw_sampling_roi(seg, geom_data, 1, 1, fill=1)
                     t2 = time.time()
 
                     # Save the patch as a NIFTI file (should be optional)
@@ -151,7 +161,8 @@ class WildcatInferenceOnSamplingROI:
                     seg_itk.CopyInformation(dens)
                     
                     # Write the density image and the segmentation
-                    sitk.WriteImage(dens, f'{fn_base}_density_{wildcat.suffix}.nii.gz')
+                    dname = 'density' + f'{self.suffix}' if self.suffix is not None else ''
+                    sitk.WriteImage(dens, f'{fn_base}_{dname}.nii.gz')
                     sitk.WriteImage(seg_itk, f'{fn_base}_mask.nii.gz')
                     t3 = time.time()
 
