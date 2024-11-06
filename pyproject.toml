@@ -11,5 +11,7 @@ name = "phas-gears"
 version = "0.0.1"
 dependencies = [
     "phas",
-    "tangle-cnn"
+    "tangle-cnn",
+    "pyyaml",
+    "pydantic"
 ]

@@ -12,23 +12,186 @@ import os
 import json
 import time
 import SimpleITK as sitk
-from PIL import Image
+from PIL import Image   
+
+import pymetis
+from scipy.sparse import csr_matrix, eye
+from sklearn.feature_extraction.image import grid_to_graph
+
+import pydantic
+import yaml
+
+from pydantic import BaseModel
+from typing import Dict, Literal, List
+
+class WildcatInferenceParameters(BaseModel):
+    """Parameters for WildCat inference"""
+    
+    #: Name of the stain
+    stain: str
+    
+    #: Suffix for the output files, may include name of experiment, etc.
+    suffix: str
+    
+    #: Contrasts to evaluate, in form 'name':class_id, where class_id is one of the classes in WildCat training
+    contrasts: Dict [str, int]
+    
+    #: Resolution in mm to which slides should be resampled before running Wildcat.
+    target_resolution = 0.0004
+    
+    #: Additional downsampling for the density maps - to conserve space
+    downsample: int = 8
+    
+    #: Window size for inference
+    window: int = 1024
+    
+    #: Normalization for computing summary statistics, 'minus_others' means class K minus all other classes, 'none' means just class K
+    normalization: Literal ['none','minus_others'] = 'none'
+    
+    #: Quantiles to report from cluster-level activation map averages
+    quantiles: List [float] = [ 0.5, 0.8, 0.9, 0.95, 0.98, 0.99 ]
+    
+    #: Area of a cluster for cluster-level statistics
+    cluster_area: float = 0.04
+    
+    #: Additional padding for sampling ROIs
+    roi_padding: int = 0
+
 
 class WildcatInferenceOnSamplingROI:
 
-    def __init__(self, wildcat:TrainedWildcat, suffix):
+    def __init__(self, wildcat:TrainedWildcat, param: WildcatInferenceParameters):
         self.wildcat = wildcat
+        self.param = param
         self.gcs_client = None
         self.gcs_cache = None
-        self.suffix = suffix
+        
+    def _fn_state(self, workdir, slide_id):
+        return os.path.join(workdir, f'slide_{slide_id}_sroi_state.json')
+
+    def _fn_density(self, workdir, slide_id, label, patch):
+        return os.path.join(workdir, f'slide_{slide_id}_label_{label:03d}_patch_{patch:03d}_density_{self.param.suffix}.nii.gz')
+    
+    def _fn_mask(self, workdir, slide_id, label, patch):
+        return os.path.join(workdir, f'slide_{slide_id}_label_{label:03d}_patch_{patch:03d}_mask.nii.gz')
+    
+    def _fn_cluster_labels(self, workdir, slide_id, label, patch):
+        return os.path.join(workdir, f'slide_{slide_id}_label_{label:03d}_patch_{patch:03d}_density_{self.param.suffix}_clusters.nii.gz')
+        
+    def _fn_cluster_heatmap(self, workdir, slide_id, label, patch, contrast):
+        return os.path.join(workdir, f'slide_{slide_id}_label_{label:03d}_patch_{patch:03d}_density_{self.param.suffix}_clustermap_{contrast}.nii.gz')
+    
+    def _fn_sampling_roi_stats(self, workdir, slide_id):
+        return os.path.join(workdir, f'slide_{slide_id}_sroi_stats_{self.param.suffix}.json')
+        
+    def _fn_sampling_roi_cluster_stats(self, workdir, slide_id):
+        return os.path.join(workdir, f'slide_{slide_id}_sroi_cluster_activation_{self.param.suffix}.csv')
+        
+    def compute_superpixel_stats(self, work_dir, slide_id):
+        
+        # Look in the slide directory for the listing of ROIs
+        with open(self._fn_state(slide_id)) as sroi_json_fd:
+            rois = json.load(sroi_json_fd)['rois']
+
+        # Get the list of unique labels
+        unique_labels = set([x['label'] for x in rois])
+
+        # Create a pandas frame to hold individual patch measures for validation
+        patch_data = {'id':[], 'slide':[], 'label':[], 'patch':[], 'contrast':[], 'value':[]}
+
+        # Repeat for each label
+        quantiles = dict()
+        for label in unique_labels:
+
+            # List of tangle/thread values for all cells
+            val = { k:[] for k in self.param.contrasts.keys() }
+            n_cells = 0
+            for i, roi_dict in enumerate([x for x in rois if x['label'] == label]):
+
+                # Load the density image
+                img_density = sitk.ReadImage(self._fn_density(work_dir, slide_id, label, i))
+
+                # Load the mask image for this ROI
+                img_roi = sitk.ReadImage(self._fn_mask(work_dir, slide_id, label, i))
+
+                # We want the average area of a sampling region to be 200x200 microns
+                pix_area = img_density.GetSpacing()[0] * img_density.GetSpacing()[1]
+                pix_per_cluster = self.param.cluster_area / pix_area
+
+                # Get the density maps for the tangles and threads (or whatever we are looking for)
+                density = sitk.GetArrayFromImage(img_density)
+                if self.param.normalization == 'minus_others':
+                    d = { k: np.maximum(density[:,:,v] * 2 - density.sum(axis=2), 0) for k,v in self.param.contrasts.items() }
+                else:
+                    d = { k: np.maximum(density[:,:,v],0) for k,v in self.param.contrasts.items() }
+
+                # Resample the boxes into the density space
+                img_roi_big = sitk.Resample(img_roi, img_density, interpolator=sitk.sitkNearestNeighbor)
+                roi = sitk.GetArrayFromImage(img_roi_big).astype(np.float32)
+
+                # Find the number of averaging patches to generate
+                n_clusters = int(np.ceil(np.sum(roi > 0) / pix_per_cluster))
+                if n_clusters == 0:
+                    continue
+
+                n_cells += n_clusters
+            
+                # Generate the clusters with METIS
+                G = grid_to_graph(roi.shape[0], roi.shape[1], 1, mask=roi>0, return_as=csr_matrix)
+                G = G - eye(G.shape[0])
+                Gp = pymetis.part_graph(n_clusters, xadj=G.indptr, adjncy=G.indices, recursive=True)
+
+                # Label the pixels in the ROI by METIS part number
+                roi_part = np.zeros_like(roi, dtype=np.int32)
+                roi_part[roi>0] = np.array(Gp[1], dtype=np.int32)+1
+                
+                # Save the clusters
+                img_roi_part = sitk.GetImageFromArray(roi_part, isVector=False)
+                img_roi_part.CopyInformation(img_density)
+                sitk.WriteImage(img_roi_part, self._fn_cluster_labels(work_dir, slide_id, label, i))
+
+                # Compute the average tangles/threads in each ROI
+                for k, d_roi_k in d.items():
+                    # Create an image for this contrast where we assign each ROI the computed value
+                    roi_hmap = np.zeros_like(roi, dtype=np.float32)
+                    roi_hmap[roi==0] = np.nan
+
+                    for j in range(np.max(roi_part)):
+                        mask = np.where(roi_part==j+1, 1, 0)
+                        d_roi_masked = np.maximum(d_roi_k * mask, 0)
+                        f = np.sum(d_roi_masked) / np.sum(mask)
+                        val[k].append(f)
+                        roi_hmap[roi_part==j+1] = f
+                        for key in ('id','slide','label'):
+                            patch_data[key].append(roi_dict[key])
+                        patch_data['patch'].append(j)
+                        patch_data['contrast'].append(k)
+                        patch_data['value'].append(f)
+                        
+                    # Save the ROI heat map
+                    img_hmap = sitk.GetImageFromArray(roi_hmap, isVector=False)
+                    img_hmap.CopyInformation(img_density)
+                    sitk.WriteImage(img_hmap, self._fn_cluster_heatmap(work_dir, slide_id, label, i, k))
+
+            # Compute the quantiles
+            if n_cells > 0:
+                quantiles[label] = { 'n_cells': n_cells }
+                for k,v in val.items():
+                    quantiles[label][k] = { q : np.quantile(v, q) for q in self.param.qtile_list }
+                print(f'Label: {label}, Quantiles: {quantiles[label]}')
+
+        # Write the summary statistics
+        with open(self._fn_sampling_roi_stats(work_dir, slide_id), 'wt') as stats_fd:
+            json.dump(quantiles, stats_fd)
+
+        # Write the per-patch data
+        df = pd.DataFrame(data=patch_data)
+        df.to_csv(self._fn_sampling_roi_cluster_stats(work_dir, slide_id))
+    
     
     def run_on_slide(self,
                      slide: Slide,
-                     output_dir:str, 
-                     target_resolution:float=0.0004,
-                     roi_padding:int=0, 
-                     window:int = 1024,
-                     shrink:int = 8,
+                     output_dir:str,
                      newer_only:bool=False):
             """Run WildCat on sampling ROIs from one slide.
             
@@ -37,11 +200,6 @@ class WildcatInferenceOnSamplingROI:
                     are defined and for which inference will be performed. The ``task`` attribute
                     of the slide must be of type ``phas.client.api.SamplingROITask``.
                 output_dir (str): Path to the output folder where heat maps will be stored
-                target_resolution (float, optional): Resolution in mm to which slides should be 
-                    resampled before running Wildcat. Defaults to 0.0004 (0.4µm)
-                roi_padding (int, optional): Additional padding around the ROI, in pixels. Defaults to 0.
-                window (int, optional): Window size when performing inference, defaults to 1024
-                shrink (int, optional): Shrink factor for output density map, defaults to 8
                 newer_only (bool, optional): Use header information to avoid overwriting previous inference results
             """
         
@@ -53,7 +211,7 @@ class WildcatInferenceOnSamplingROI:
 
             # Check if the density already exists and is up to date
             curr_state = { 'rois': rois, 'dimensions': slide.dimensions, 'spacing': slide.spacing, 'slide_fn': slide.fullpath }
-            state_file = os.path.join(output_dir, 'sroi_state.json')
+            state_file = self._fn_state(slide.slide_id)
             if newer_only:
                 print(f'checking {state_file}')
                 if os.path.exists(state_file):
@@ -90,11 +248,8 @@ class WildcatInferenceOnSamplingROI:
                     
                     # Apply padding to the bounding box
                     raw_spacing = slide.spacing
-                    padpx = int(np.ceil(roi_padding * target_resolution / raw_spacing[0]))
+                    padpx = int(np.ceil(self.param.roi_padding * self.param.target_resolution / raw_spacing[0]))
                     (x_min, y_min, x_max, y_max) = (x_min - padpx, y_min - padpx, x_max + padpx, y_max + padpx)
-
-                    # Define the base filename for the output
-                    fn_base = os.path.join(output_dir, f'{slide.slide_id}_label_{label:03d}_patch_{i:03d}')
 
                     # For wildcat, region must be specified in units of windows or in relative units.
                     x_min_r, x_max_r = max(0.0, x_min / slide.dimensions[0]), min(1.0, x_max / slide.dimensions[0])
@@ -105,10 +260,10 @@ class WildcatInferenceOnSamplingROI:
                     # Apply Wildcat on this region
                     t0 = time.time()
                     dens = self.wildcat.apply(osl=wc_datasource, 
-                                              window_size=window, 
-                                              extra_shrinkage=shrink, 
+                                              window_size=self.param.window, 
+                                              extra_shrinkage=self.param.shrink, 
                                               region=region_r, 
-                                              target_resolution=target_resolution,
+                                              target_resolution=self.param.target_resolution,
                                               crop=True)
                     t1 = time.time()
 
@@ -161,9 +316,9 @@ class WildcatInferenceOnSamplingROI:
                     seg_itk.CopyInformation(dens)
                     
                     # Write the density image and the segmentation
-                    dname = 'density' + f'{self.suffix}' if self.suffix is not None else ''
-                    sitk.WriteImage(dens, f'{fn_base}_{dname}.nii.gz')
-                    sitk.WriteImage(seg_itk, f'{fn_base}_mask.nii.gz')
+                    dname = 'density' + f'_{self.suffix}' if self.suffix is not None else ''
+                    sitk.WriteImage(dens, self._fn_density(output_dir, slide.slide_id, label, i))
+                    sitk.WriteImage(seg_itk, self._fn_mask(output_dir, slide.slide_id, label, i))
                     t3 = time.time()
 
                     print(f'Completed in {t3-t0:6.4f}s, wildcat: {t1-t0:6.4f}s, draw: {t2-t1:6.4f}s, write: {t3-t2:6.4f}s')
@@ -171,13 +326,16 @@ class WildcatInferenceOnSamplingROI:
             # Store the state for the future
             with open(state_file, 'wt') as state_fd:
                 json.dump(curr_state, state_fd)
+                
+            # Compute the ROI scores on the output folder
+            self.compute_superpixel_stats(output_dir, slide.slide_id)
         
     def run_on_task(self,
                     task: SamplingROITask,
                     output_dir: str,
                     specimens = None,
                     stains = None,
-                    **kwargs):
+                    newer_only:bool=False):
         """Extract sampling ROIs from a task.
         
         Args:
@@ -186,7 +344,7 @@ class WildcatInferenceOnSamplingROI:
             output_dir (str): Path to the output folder where heat maps will be stored
             specimens (list of str, optional): Limit inferece to a set of specimens
             stains (list of str, optional): Limit inferece to a set of stains
-            **kwargs: See ``run_on_slide``.
+            newer_only (bool, optional): Use header information to avoid overwriting previous inference results
         """
         
         # Start by getting a listing of slides for this task
@@ -202,7 +360,7 @@ class WildcatInferenceOnSamplingROI:
         for slide_id, _ in manifest.iterrows():
             slide = Slide(task, slide_id)
             slide_dir = os.path.join(output_dir, f'slide_{slide.slide_id}')
-            self.run_on_slide(slide, slide_dir, **kwargs)
+            self.run_on_slide(slide, slide_dir, newer_only=newer_only)
 
     
 if __name__ == '__main__':
@@ -215,17 +373,16 @@ if __name__ == '__main__':
     parser.add_argument('-t', '--task', type=int, help='PHAS task id', required=True)
     parser.add_argument('-m', '--model', type=str, help='Path to the Wildcat trained model')
     parser.add_argument('-o', '--outdir', type=str, help='Path to the output folder', required=True)
-    parser.add_argument('-z', '--scale', type=float, help='target resolution of the patch, mm/pixel', default=0.0004)
-    parser.add_argument('-P', '--padding', type=int, help='extra padding for each ROI, pixels', default=0)
-    parser.add_argument('-w', '--window-size', type=int, help='Window size for Wildcat inference, pixels', default=None)
-    parser.add_argument('-w', '--shrink', type=int, help='Shrink factor for Wildcat inference', default=None)
+    parser.add_argument('-p', '--param', type=argparse.FileType('rt'), help='Parameter .yaml file')
     parser.add_argument('-n', '--newer', action="store_true", help='No overriding of existing results unless ROIs have changed')
     args = parser.parse_args()
 
-    conn = Client(args.server, args.apikey)
+    conn = Client(args.server, args.apikey, verify=~args.verify)
     task = SamplingROITask(conn, args.task)
     wildcat = TrainedWildcat(args.model)
-    extractor = WildcatInferenceOnSamplingROI(wildcat)
-    extractor.run_on_task(task=task, output_dir=args.outdir, specimens=args.specimens, stains=args.stains, 
-                          target_resolution=args.scale, roi_padding=args.padding, window=args.window_size,
-                          shrink=args.shrink, newer_only=args.newer)
+    param = WildcatInferenceParameters(**yaml.safe_load(args.param))
+    extractor = WildcatInferenceOnSamplingROI(wildcat, param)    
+    
+    extractor.run_on_task(task=task, output_dir=args.outdir, 
+                          specimens=args.specimens, stains=args.stains, 
+                          newer_only=args.newer)
