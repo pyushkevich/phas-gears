@@ -13,5 +13,7 @@ dependencies = [
     "phas",
     "tangle-cnn",
     "pyyaml",
-    "pydantic"
+    "pydantic",
+    "pymetis",
+    "scikit-learn"
 ]
