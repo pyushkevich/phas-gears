@@ -8,12 +8,13 @@ packages = ["phas_gears"]
 
 [project]
 name = "phas-gears"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
     "phas",
     "tangle-cnn",
     "pyyaml",
     "pydantic",
     "pymetis",
-    "scikit-learn"
+    "scikit-learn",
+    "scikit-image"
 ]
