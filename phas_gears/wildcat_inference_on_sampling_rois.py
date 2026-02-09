@@ -157,6 +157,9 @@ class WildcatInferenceOnSamplingROI:
     def _fn_sampling_roi_cluster_stats(self, workdir, slide_id):
         return os.path.join(workdir, f'slide_{slide_id}_sroi_cluster_activation_{self.param.suffix}.csv')
     
+    def _fn_sampling_roi_global_stats(self, workdir, slide_id):
+        return os.path.join(workdir, f'slide_{slide_id}_sroi_global_stats_{self.param.suffix}.csv')
+    
     def _fn_sampling_roi_local_max_stats(self, workdir, slide_id):
         return os.path.join(workdir, f'slide_{slide_id}_sroi_local_max_activation_{self.param.suffix}.csv')
         
@@ -282,7 +285,77 @@ class WildcatInferenceOnSamplingROI:
 
         # Write the per-patch data
         df = pd.DataFrame(data=patch_data)
-        df.to_csv(self._fn_sampling_roi_cluster_stats(work_dir, slide_id))
+        df.to_csv(self._fn_sampling_roi_cluster_stats(work_dir, slide_id), index=False)
+    
+    def compute_global_stats(self, work_dir, slide_id):
+        
+        # Look in the slide directory for the listing of ROIs
+        with open(self._fn_state(work_dir, slide_id)) as sroi_json_fd:
+            rois = json.load(sroi_json_fd)['rois']
+
+        # Get the list of unique labels
+        unique_labels = set([x['label'] for x in rois])
+
+        # Create a pandas frame to hold individual patch measures for validation
+        roi_data = {'slide':[], 'label':[], 'contrast':[], 'stat':[], 'stat_param':[], 'value':[]}
+
+        # Repeat for each label
+        quantiles = dict()
+        for label in unique_labels:
+
+            # List of tangle/thread values for all pixels in ROIs with this label
+            val = { k:[] for k in self.param.contrasts.keys() }
+            for i, roi_dict in enumerate([x for x in rois if x['label'] == label]):
+                
+                # The density image may not exist because the sampling region may be outside 
+                # of the slide
+                fn_den = self._fn_density(work_dir, slide_id, roi_dict)
+                if not os.path.exists(fn_den):
+                    continue
+                
+                # Load the density image and mask image
+                img_density = sitk.ReadImage(fn_den)
+
+                # Load the mask image for this ROI
+                img_roi = sitk.ReadImage(self._fn_mask(work_dir, slide_id, roi_dict))
+
+                # Get the density maps for the tangles and threads (or whatever we are looking for)
+                density = sitk.GetArrayFromImage(img_density)
+                if self.param.normalization == 'minus_others':
+                    d = { k: np.maximum(density[:,:,v] * 2 - density.sum(axis=2), 0) for k,v in self.param.contrasts.items() }
+                else:
+                    d = { k: np.maximum(density[:,:,v],0) for k,v in self.param.contrasts.items() }
+                    
+                # Resample the boxes into the density space
+                img_roi_big = sitk.Resample(img_roi, img_density, interpolator=sitk.sitkNearestNeighbor)
+                roi = sitk.GetArrayFromImage(img_roi_big).astype(np.float32)
+                
+                # Integrate the signal over the ROI
+                for k, d_roi_k in d.items():
+                    val[k].append(d_roi_k[roi > 0])
+                    
+            # Compute the quantiles and statistics
+            if len(val) > 0:
+                for stat,stat_param in [('mean', 0)] + [('quantile', q) for q in self.param.quantiles]:
+                    for k,v in val.items():
+                        if stat == 'mean':
+                            s = np.mean(np.concatenate(v))
+                        elif stat == 'quantile':
+                            s = np.quantile(np.concatenate(v), q=stat_param)
+                        else:
+                            raise ValueError(f'Unknown stat {stat}')
+
+                        roi_data['slide'].append(slide_id)
+                        roi_data['label'].append(label)
+                        roi_data['contrast'].append(k)
+                        roi_data['stat'].append(stat)
+                        roi_data['stat_param'].append(stat_param if stat == 'quantile' else np.nan)
+                        roi_data['value'].append(s)
+
+        # Write the per-patch data
+        df = pd.DataFrame(data=roi_data)
+        df.to_csv(self._fn_sampling_roi_global_stats(work_dir, slide_id), index=False)
+                
     
     def compute_multiscale_mass_stats(self, work_dir, slide_id):
         
@@ -368,7 +441,7 @@ class WildcatInferenceOnSamplingROI:
                         
         # Write the per-patch data
         df = pd.DataFrame(data=patch_data)
-        df.to_csv(self._fn_sampling_roi_local_max_stats(work_dir, slide_id))
+        df.to_csv(self._fn_sampling_roi_local_max_stats(work_dir, slide_id), index=False)
     
     def run_on_slide(self,
                      slide: Slide,
@@ -500,6 +573,7 @@ class WildcatInferenceOnSamplingROI:
                     
             # Compute the ROI scores on the output folder
             self.compute_superpixel_stats(output_dir, slide.slide_id)
+            self.compute_global_stats(output_dir, slide.slide_id)
             # self.compute_multiscale_mass_stats(output_dir, slide.slide_id)
         
     def run_on_task(self,
