@@ -24,6 +24,7 @@ p_wisr.add_argument('-t', '--task', type=int, help='PHAS task id', required=True
 p_wisr.add_argument('-m', '--model', type=str, help='Path to the Wildcat trained model')
 p_wisr.add_argument('--specimens', type=str, nargs='+', help='Limit analysis to a set of specimens')
 p_wisr.add_argument('--stains', type=str, nargs='+', help='Limit analysis to a set of stains')
+p_wisr.add_argument('--authors', type=int, nargs='+', help='Limit analysis to ROIs by certain authors. Provides a list of PHAS user ids. If both creator and editor are in the list, the ROI will be included.')
 p_wisr.add_argument('-o', '--outdir', type=str, help='Path to the output folder', required=True)
 p_wisr.add_argument('-p', '--param', type=argparse.FileType('rt'), required=True, help='Parameter .yaml file')
 p_wisr.add_argument('-n', '--newer', action="store_true", help='No overriding of existing results unless ROIs have changed')

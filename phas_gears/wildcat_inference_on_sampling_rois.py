@@ -162,6 +162,9 @@ class WildcatInferenceOnSamplingROI:
     
     def _fn_sampling_roi_local_max_stats(self, workdir, slide_id):
         return os.path.join(workdir, f'slide_{slide_id}_sroi_local_max_activation_{self.param.suffix}.csv')
+    
+    def _fn_cluster_task_stats(self, workdir, task_id):
+        return os.path.join(workdir, f'task_{task_id}_sroi_cluster_stats.csv')
         
     def compute_superpixel_stats(self, work_dir, slide_id):
         
@@ -173,7 +176,7 @@ class WildcatInferenceOnSamplingROI:
         unique_labels = set([x['label'] for x in rois])
 
         # Create a pandas frame to hold individual patch measures for validation
-        patch_data = {'id':[], 'slide':[], 'label':[], 'patch':[], 'contrast':[], 'value':[], 'ncells':[]}
+        patch_data = {'id':[], 'slide':[], 'label':[], 'patch':[], 'contrast':[], 'area':[], 'value':[], 'ncells':[]}
 
         # Repeat for each label
         quantiles = dict()
@@ -239,6 +242,9 @@ class WildcatInferenceOnSamplingROI:
                     roi_hmap = np.zeros_like(roi, dtype=np.float32)
                     roi_hmap[roi==0] = np.nan
                     
+                    # Compute the areas of the clusters
+                    areas = np.bincount(roi_part.flatten()) * np.prod(img_density.GetSpacing())
+                    
                     # Use bincount to quickly integrate over patches for this computation
                     bc = np.bincount(roi_part.flatten(), weights=np.maximum(d_roi_k, 0).flatten()) / np.bincount(roi_part.flatten())
                     bc[0] = 0
@@ -250,6 +256,7 @@ class WildcatInferenceOnSamplingROI:
                     patch_data['patch'] += range(0, len(bc)-1)
                     patch_data['contrast'] += [k] * (len(bc)-1)
                     patch_data['value'] += bc[1:].tolist()
+                    patch_data['area'] += areas[1:].tolist()
                     
                     # Quickly count how many discrete cells there are - this is lame because we are doing watershed
                     # on downsampled images, but this is just a test
@@ -446,7 +453,8 @@ class WildcatInferenceOnSamplingROI:
     def run_on_slide(self,
                      slide: Slide,
                      output_dir:str,
-                     newer_only:bool=False):
+                     newer_only:bool=False,
+                     authors:List[int]|None = None):
             """Run WildCat on sampling ROIs from one slide.
             
             Args:
@@ -455,10 +463,15 @@ class WildcatInferenceOnSamplingROI:
                     of the slide must be of type ``phas.client.api.SamplingROITask``.
                 output_dir (str): Path to the output folder where heat maps will be stored
                 newer_only (bool, optional): Use header information to avoid overwriting previous inference results
+                authors (list of int, optional): Limit inference to ROIs by certain authors
             """
         
             # Get the list of sampling ROIs for the subject we want to analyze
             rois = slide.task.slide_sampling_rois(slide.slide_id)
+            
+            # Filter by authors if specified
+            if authors is not None:
+                rois = [x for x in rois if (x['creator'] in authors) and (x['editor'] in authors)]
 
             # Create the output directory
             os.makedirs(output_dir, exist_ok=True)
@@ -575,12 +588,64 @@ class WildcatInferenceOnSamplingROI:
             self.compute_superpixel_stats(output_dir, slide.slide_id)
             self.compute_global_stats(output_dir, slide.slide_id)
             # self.compute_multiscale_mass_stats(output_dir, slide.slide_id)
+            
+    def compute_task_stats(self, task: SamplingROITask, manifest: pd.DataFrame, output_dir: str):
+        
+        # Get a listing of the labels used for this task
+        df_labels = pd.DataFrame(task.labelset.label_listing())
+        
+        # Load the CSVs for all the slides in this task
+        csv_merge = []
+        for slide_id, _ in manifest.iterrows():
+            slide = Slide(task, slide_id)
+            slide_dir = self._wdir(output_dir, slide)
+            fn_csv = self._fn_sampling_roi_cluster_stats(slide_dir, slide_id)
+            try:
+                csv_merge.append(pd.read_csv(fn_csv, index_col=0))
+            except:
+                print(f'Warining: failed to read {fn_csv} when aggregating stats')
+                
+        def agg_burden(qtile):
+            return lambda x: np.quantile(x, qtile)
+
+        def agg_ncells(q1, q2):
+            return lambda x: 0.5 * (np.quantile(x, q1) + np.quantile(x, q2))                
+        
+        # Collect aggregate statistics
+        df_aggstat = pd.concat(csv_merge)
+        df_aggstat = df_aggstat.groupby(['id','slide','label','contrast']).agg(
+            burden_90pt=('value', agg_burden(0.9)),
+            burden_95pt=('value', agg_burden(0.95)),
+            burden_99pt=('value', agg_burden(0.99)),
+            burden_total=('value', 'sum'),
+            ncells_90pt=('ncells', agg_ncells(0.85,0.95)),
+            ncells_total=('ncells', 'sum'),
+            area_total=('area', 'sum')).reset_index().rename(columns={'id': 'roi_id'})
+
+        df_aggstat['burden_mean'] = df_aggstat['burden_total'] / df_aggstat['area_total']
+        df_aggstat['cell_density'] = df_aggstat['ncells_total'] / df_aggstat['area_total']
+        
+        # Merge with task and label id data
+        df_aggstat = manifest.reset_index()[['id','specimen_private','block_name','section','slide']].rename(
+            columns={'id':'slide', 'slide':'slide_no', 'specimen_private': 'specimen'}).merge(
+                df_aggstat, how='right').merge(
+                    df_labels[['id','name']], left_on='label', right_on='id').drop(columns=['id']).rename(
+                        columns={'label': 'label_id', 'name': 'label'})
+                    
+        # Reorder columns
+        col = df_aggstat.columns
+        df_aggstat = df_aggstat[col[:7].tolist() + col[-1:].tolist() + col[7:-1].tolist()]
+        
+        # Write the statistics out to file
+        df_aggstat.to_csv(self._fn_cluster_task_stats(output_dir, task.task_id))
+        
         
     def run_on_task(self,
                     task: SamplingROITask,
                     output_dir: str,
                     specimens = None,
                     stains = None,
+                    authors:List[int]|None = None,
                     newer_only:bool=False):
         """Extract sampling ROIs from a task.
         
@@ -606,7 +671,10 @@ class WildcatInferenceOnSamplingROI:
         for slide_id, _ in manifest.iterrows():
             slide = Slide(task, slide_id)
             slide_dir = self._wdir(output_dir, slide)
-            self.run_on_slide(slide, slide_dir, newer_only=newer_only)
+            self.run_on_slide(slide, slide_dir, newer_only=newer_only, authors=authors)
+            
+        # Compute the global statistics for all slides in the task
+        self.compute_task_stats(task, manifest, output_dir)
             
             
 def wildcat_inference_on_sampling_rois_main(args):
@@ -618,5 +686,5 @@ def wildcat_inference_on_sampling_rois_main(args):
     extractor = WildcatInferenceOnSamplingROI(wildcat, param)    
 
     extractor.run_on_task(task=task, output_dir=args.outdir, 
-                            specimens=args.specimens, stains=args.stains, 
-                            newer_only=args.newer)
+                          specimens=args.specimens, stains=args.stains, authors=args.authors,
+                          newer_only=args.newer)
