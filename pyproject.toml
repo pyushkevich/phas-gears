@@ -16,5 +16,7 @@ dependencies = [
     "pydantic",
     "pymetis",
     "scikit-learn",
-    "scikit-image"
+    "scikit-image",
+    "pandas",
+    "pillow"
 ]
