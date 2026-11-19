@@ -1,5 +1,9 @@
 This repository contains analysis pipelines for the PICSL Histology Annotation Server (PHAS).
 
+Install with `pip install .` (or `pip install -e .` for development), which provides the
+`phas-gears` command. Each gear is a sub-command, e.g. `phas-gears clone_samples -h`.
+`python -m phas_gears` works as well.
+
 ## Gears
 
 ### `clone_samples`: download training sample patches
@@ -8,7 +12,7 @@ Downloads image patches around the training samples (user-placed boxes) in a PHA
 classifier training (`dltrain`) task, optionally resampled to a target resolution.
 
 ```sh
-python -m phas_gears clone_samples -s https://histo.itksnap.org -k api_key.json \
+phas-gears clone_samples -s https://histo.itksnap.org -k api_key.json \
     -t 1 -o samples/ -r 0.4 -p 256
 ```
 

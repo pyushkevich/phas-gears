@@ -20,3 +20,6 @@ dependencies = [
     "pandas",
     "pillow"
 ]
+
+[project.scripts]
+phas-gears = "phas_gears.__main__:main"
