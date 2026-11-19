@@ -71,13 +71,48 @@ def main():
     p_cs.add_argument('-j', '--jobs', type=int, default=4, help='Number of parallel downloads (default: 4)')
     p_cs.add_argument('--tile-size', type=int, default=1024, help=argparse.SUPPRESS)
 
+    # Parser for organize_samples (works offline, so it does not take the server options)
+    p_os = subs.add_parser('organize_samples',
+                           description='Organize patches downloaded by clone_samples into '
+                                       'patches/{train,val,test}/<class>/ folders for classifier '
+                                       'training. Samples are split so that each specimen/slide is in '
+                                       'a single fold, with class proportions kept similar across folds.',
+                           help='Split downloaded training samples into train/val/test folders')
+    p_os.add_argument('-i', '--input', type=str, required=True, metavar='DIR',
+                      help='Output folder of clone_samples (with manifest.csv and patches/)')
+    p_os.add_argument('-o', '--outdir', type=str, required=True, metavar='DIR',
+                      help='Experiment folder to create; its patches/ subfolder is rebuilt on each run')
+    p_os.add_argument('-c', '--classes', type=str, required=True, metavar='JSON',
+                      help='JSON file mapping PHAS labels (regular expressions, full match) to classes')
+    p_os.add_argument('--split-by', choices=['specimen', 'slide', 'sample'], required=True,
+                      help='Unit kept together when splitting into folds. "specimen" gives the most '
+                           'honest validation/test estimates; "sample" lets near-duplicate samples '
+                           'from the same tissue end up in different folds')
+    p_os.add_argument('--val-fraction', type=float, default=0.2, metavar='F',
+                      help='Fraction of samples for validation (default: 0.2)')
+    p_os.add_argument('--test-fraction', type=float, default=0.0, metavar='F',
+                      help='Fraction of samples for testing (default: 0)')
+    p_os.add_argument('--val-specimens', type=str, nargs='+',
+                      help='Use these specimens for validation (replaces --val-fraction)')
+    p_os.add_argument('--test-specimens', type=str, nargs='+',
+                      help='Use these specimens for testing (replaces --test-fraction)')
+    p_os.add_argument('--exclude-specimens', type=str, nargs='+', help='Leave out these specimens')
+    p_os.add_argument('--max-train', type=int, metavar='N', help='Max samples per class in train (default: no limit)')
+    p_os.add_argument('--max-val', type=int, metavar='N', help='Max samples per class in val (default: no limit)')
+    p_os.add_argument('--max-test', type=int, metavar='N', help='Max samples per class in test (default: no limit)')
+    p_os.add_argument('--balance-val', action='store_true',
+                      help='Downsample validation so that all classes have as many samples as the smallest')
+    p_os.add_argument('--drop-unmatched', action='store_true',
+                      help='Drop samples whose label matches no class (default: report an error)')
+    p_os.add_argument('--seed', type=int, default=0, help='Random seed (default: 0)')
+
     # Parse the arguments
     args = pp.parse_args()
 
     # With SSL verification disabled, do not print a warning on every request. The PHAS client
     # resets warning filters around each request (which overrides urllib3.disable_warnings and
     # is not thread-safe), so the warning is dropped at display time instead.
-    if args.no_verify:
+    if getattr(args, 'no_verify', False):
         import warnings
         from urllib3.exceptions import InsecureRequestWarning
         _showwarning = warnings.showwarning
@@ -96,6 +131,9 @@ def main():
             p_cs.error('--server-patches cannot be combined with --resolution, --patch-size or --padding')
         from .clone_samples import clone_samples_main
         clone_samples_main(args)
+    elif args.action == 'organize_samples':
+        from .organize_samples import organize_samples_main
+        organize_samples_main(args)
 
 
 if __name__ == '__main__':

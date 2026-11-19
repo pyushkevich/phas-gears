@@ -8,7 +8,7 @@ packages = ["phas_gears"]
 
 [project]
 name = "phas-gears"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
     "phas",
     "tangle-cnn",
