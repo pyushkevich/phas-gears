@@ -363,10 +363,6 @@ def write_outputs(df, outdir, failed):
 
 
 def clone_samples_main(args):
-    if args.no_verify:
-        # The client toggles this warning filter per request, which is not thread-safe
-        import urllib3
-        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     conn = Client(args.server, args.apikey, verify=not args.no_verify)
     task = DLTrainingTask(conn, args.task)
     os.makedirs(args.outdir, exist_ok=True)

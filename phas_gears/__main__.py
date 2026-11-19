@@ -74,6 +74,18 @@ def main():
     # Parse the arguments
     args = pp.parse_args()
 
+    # With SSL verification disabled, do not print a warning on every request. The PHAS client
+    # resets warning filters around each request (which overrides urllib3.disable_warnings and
+    # is not thread-safe), so the warning is dropped at display time instead.
+    if args.no_verify:
+        import warnings
+        from urllib3.exceptions import InsecureRequestWarning
+        _showwarning = warnings.showwarning
+        def _showwarning_filtered(message, category, *a, **kw):
+            if not issubclass(category, InsecureRequestWarning):
+                _showwarning(message, category, *a, **kw)
+        warnings.showwarning = _showwarning_filtered
+
     # Execute the correct command. Imports are deferred so that each gear only loads its own dependencies
     if args.action == 'wildcat_roi':
         from .wildcat_inference_on_sampling_rois import wildcat_inference_on_sampling_rois_main
