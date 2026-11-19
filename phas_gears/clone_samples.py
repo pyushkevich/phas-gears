@@ -5,7 +5,9 @@ tanglethon-ipynb repository. In addition to the original functionality it suppor
 
 * resampling patches to a target resolution (microns per pixel),
 * filtering samples by specimen, stain, label and user (creator/editor),
-* recording the location of each sample's box within its patch in the manifest.
+* recording the location of each sample's box within its patch in the manifest,
+* a fast mode (``--server-patches``) that downloads the patches that the server already
+  stores for each sample, instead of extracting new patches from the slide.
 
 Coordinates on the server are in full-resolution (level 0) slide pixels. All patch
 sizes and paddings given on the command line are in *output* pixels, i.e., pixels at
@@ -13,7 +15,7 @@ the target resolution.
 """
 
 from phas.client.api import Client, DLTrainingTask, Slide
-from phas.dltrain import get_sample_manifest_for_task
+from phas.dltrain import get_sample_manifest_for_task, get_sample_png
 from phas.dzi import get_patch_endpoint
 from PIL import Image
 from io import BytesIO, StringIO
@@ -29,14 +31,15 @@ import threading
 
 @dataclass
 class PatchSpec:
-    """A rectangular region around a sample to download from a slide, in level-0 pixel units."""
+    """A rectangular region around a sample to download from a slide, in level-0 pixel units.
+    For server-stored patches, the geometry is unknown until the patch is downloaded."""
     sample_id: int
     slide_id: int
-    x0: float
-    y0: float
-    width: int                  # Output width, pixels at target resolution
-    height: int                 # Output height, pixels at target resolution
-    scale: float                # Size of an output pixel in level-0 pixels
+    x0: Optional[float] = None
+    y0: Optional[float] = None
+    width: Optional[int] = None     # Output width, pixels at target resolution
+    height: Optional[int] = None    # Output height, pixels at target resolution
+    scale: float = 1.0              # Size of an output pixel in level-0 pixels
 
     @property
     def filename(self):
@@ -57,8 +60,9 @@ class SampleCloner:
 
     def __init__(self, task: DLTrainingTask, resolution: Optional[float] = None,
                  patch_size: Optional[int] = None, padding: int = 0,
-                 tile_size: int = 1024):
+                 tile_size: int = 1024, server_patches: bool = False):
         self.task = task
+        self.server_patches = server_patches
         self.resolution = resolution
         self.patch_size = patch_size
         self.padding = padding
@@ -89,9 +93,10 @@ class SampleCloner:
                          na_values=['None'])
         print(f'Server manifest lists {len(df)} samples')
 
-        # Slides without metadata (pixel spacing) cannot be read from the server
+        # Slides without metadata (pixel spacing) cannot be read from the server. This does
+        # not matter for server-stored patches, which do not require reading the slide.
         no_meta = df.mpp_x.isna()
-        if no_meta.any():
+        if no_meta.any() and not self.server_patches:
             print(f'Warning: skipping {no_meta.sum()} samples on {df.loc[no_meta].slide_name.nunique()} '
                   f'slides for which the server has no slide metadata (slide file unavailable?)')
             df = df.loc[~no_meta]
@@ -198,8 +203,11 @@ class SampleCloner:
         """Compute the patch to download for each sample.
 
         Returns:
-            (list of PatchSpec, DataFrame df with added patch/box columns)
+            list of PatchSpec
         """
+        if self.server_patches:
+            return [PatchSpec(sample_id=int(r.id), slide_id=int(r.slide_id)) for r in df.itertuples()]
+
         specs = []
         for slide_id, df_slide in df.groupby('slide_id'):
             mpp_mm = float(df_slide.mpp_x.iloc[0])
@@ -209,12 +217,15 @@ class SampleCloner:
                       f'resolution {1000 * mpp_mm:.4f}um (slide {slide_id}); patches will be upsampled')
                 self._warned_upsample = True
             specs.extend(self.make_patch_spec(row, d) for row in df_slide.itertuples())
+        return specs
 
+    def patch_table(self, df, specs):
+        """Add patch geometry and the box location within the patch to the samples table."""
         df_patch = pd.DataFrame([{
             'id': s.sample_id, 'patch': s.filename,
             'patch_x0': s.x0, 'patch_y0': s.y0, 'patch_scale': s.scale,
             'patch_width': s.width, 'patch_height': s.height,
-            'resolution': self.resolution if self.resolution else '',
+            'resolution': '' if (self.server_patches or not self.resolution) else self.resolution,
         } for s in specs])
         df_out = df.merge(df_patch, on='id', how='left')
 
@@ -224,7 +235,28 @@ class SampleCloner:
         df_out['box_w'] = (df_out.w / df_out.patch_scale).round(2)
         df_out['box_h'] = (df_out.h / df_out.patch_scale).round(2)
         df_out = df_out.round({'patch_x0': 2, 'patch_y0': 2, 'patch_scale': 6})
-        return specs, df_out
+        return df_out
+
+    # Server patches generated before histoannot commit 8055360 (2019-09-17) have their corner
+    # at ctr - (w - int(w/2) - 1), i.e., one pixel later than patches generated since then,
+    # which have their corner at ctr - int(w/2). Patches are regenerated when samples are
+    # edited, so the sample's last edit time tells which convention applies.
+    SERVER_PATCH_ORIGIN_CHANGE = 1568733791
+
+    @classmethod
+    def set_server_patch_geometry(cls, spec, row, size):
+        """Fill in the geometry of a server-stored patch from its size. The server centers the
+        patch on the box center rounded to a whole pixel, and reads it from full resolution."""
+        spec.width, spec.height = size
+        ctr_x = int((2 * row.x + row.w) / 2.0 + 0.5)
+        ctr_y = int((2 * row.y + row.h) / 2.0 + 0.5)
+        if row.t_edit < cls.SERVER_PATCH_ORIGIN_CHANGE:
+            spec.x0 = float(ctr_x - (spec.width - int(spec.width / 2.0) - 1))
+            spec.y0 = float(ctr_y - (spec.height - int(spec.height / 2.0) - 1))
+        else:
+            spec.x0 = float(ctr_x - int(spec.width * 0.5))
+            spec.y0 = float(ctr_y - int(spec.height * 0.5))
+        spec.scale = 1.0
 
     # ------------------------------------------------------------------
     # Downloading
@@ -277,6 +309,17 @@ class SampleCloner:
         rgb.save(tmp)
         os.replace(tmp, filename)
 
+    def download_server_patch(self, spec: PatchSpec, filename):
+        """Download the patch that the server stores for the sample. Returns its size."""
+        r = self.task.client._get('dltrain', get_sample_png, id=spec.sample_id)
+        img = Image.open(BytesIO(r.content))
+        img.load()
+        tmp = filename + '.tmp.png'
+        with open(tmp, 'wb') as f:
+            f.write(r.content)
+        os.replace(tmp, filename)
+        return img.size
+
     def download_all(self, specs, outdir, jobs=4, skip_existing=False):
         os.makedirs(os.path.join(outdir, 'patches'), exist_ok=True)
 
@@ -290,11 +333,14 @@ class SampleCloner:
 
         failed = set()
         with ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
-            futures = {pool.submit(self.download_patch, spec, fn): spec for spec, fn in todo}
+            func = self.download_server_patch if self.server_patches else self.download_patch
+            futures = {pool.submit(func, spec, fn): spec for spec, fn in todo}
             for k, fut in enumerate(as_completed(futures)):
                 spec = futures[fut]
                 try:
-                    fut.result()
+                    size = fut.result()
+                    if self.server_patches:
+                        spec.width, spec.height = size
                 except Exception as e:
                     print(f'Failed to download patch for sample {spec.sample_id} '
                           f'(slide {spec.slide_id}): {e}', file=sys.stderr)
@@ -326,7 +372,8 @@ def clone_samples_main(args):
     os.makedirs(args.outdir, exist_ok=True)
 
     cloner = SampleCloner(task, resolution=args.resolution, patch_size=args.patch_size,
-                          padding=args.padding, tile_size=args.tile_size)
+                          padding=args.padding, tile_size=args.tile_size,
+                          server_patches=args.server_patches)
 
     df = cloner.load_samples(
         specimens=args.specimens, exclude_specimens=args.exclude_specimens, stains=args.stains,
@@ -338,14 +385,28 @@ def clone_samples_main(args):
         print('No samples to download')
         return
 
-    specs, df = cloner.plan_patches(df)
-    npix = sum(s.width * s.height for s in specs)
-    print(f'Planned {len(specs)} patches, {npix / 1e6:.1f} Mpixels total')
+    specs = cloner.plan_patches(df)
+    if args.server_patches:
+        print(f'Planned {len(specs)} server-stored patches')
+    else:
+        npix = sum(s.width * s.height for s in specs)
+        print(f'Planned {len(specs)} patches, {npix / 1e6:.1f} Mpixels total')
 
     failed = set()
     if not args.no_patches:
         failed = cloner.download_all(specs, args.outdir, jobs=args.jobs,
                                      skip_existing=args.skip_existing)
 
-    write_outputs(df, args.outdir, failed)
+    # Geometry of server-stored patches is derived from the size of the downloaded files
+    if args.server_patches:
+        rows = df.set_index('id')
+        for spec in specs:
+            fn = os.path.join(args.outdir, spec.filename)
+            if spec.width is None and spec.sample_id not in failed and os.path.exists(fn):
+                with Image.open(fn) as img:
+                    spec.width, spec.height = img.size
+            if spec.width is not None:
+                cloner.set_server_patch_geometry(spec, rows.loc[spec.sample_id], (spec.width, spec.height))
+
+    write_outputs(cloner.patch_table(df, specs), args.outdir, failed)
     print(f'Wrote manifest to {os.path.join(args.outdir, "manifest.csv")}')

@@ -47,6 +47,11 @@ def main():
                            'Default: patch covers the box plus padding')
     p_cs.add_argument('--padding', type=int, default=0, metavar='N',
                       help='Padding around the box in pixels, when --patch-size is not used')
+    p_cs.add_argument('-S', '--server-patches', action='store_true',
+                      help='Fast mode: download the patches already stored on the server for each '
+                           'sample (fixed size, typically 512x512 at full resolution, centered on '
+                           'the box) instead of extracting new patches from the slides. '
+                           'Cannot be combined with -r, -p or --padding')
     p_cs.add_argument('--specimens', type=str, nargs='+', help='Only include these specimens')
     p_cs.add_argument('--exclude-specimens', type=str, nargs='+', help='Exclude these specimens')
     p_cs.add_argument('--stains', type=str, nargs='+', help='Only include these stains')
@@ -75,6 +80,8 @@ def main():
         print(args)
         wildcat_inference_on_sampling_rois_main(args)
     elif args.action == 'clone_samples':
+        if args.server_patches and (args.resolution or args.patch_size or args.padding):
+            p_cs.error('--server-patches cannot be combined with --resolution, --patch-size or --padding')
         from .clone_samples import clone_samples_main
         clone_samples_main(args)
 
